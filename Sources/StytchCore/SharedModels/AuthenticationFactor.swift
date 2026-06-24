@@ -13,12 +13,12 @@ public struct AuthenticationFactor: Sendable {
 
     /// The underlying data representing this factor. Includes additional information about the specific factor ids and values.
     public let rawData: JSON
-    /// The type of factor, e.g. magic link, OTP, TOTP, etc.
-    public let kind: String
+    /// The type of factor, e.g. magic link, OTP, TOTP, etc. Factor types the SDK does not yet model decode to `.unknown`; the raw string remains available via `rawData["type"]`.
+    public let kind: AuthenticationFactorType
     /// The date this factor was last used to authenticate.
     public let lastAuthenticatedAt: Date
 
-    public init(rawData: JSON, kind: String, lastAuthenticatedAt: Date) {
+    public init(rawData: JSON, kind: AuthenticationFactorType, lastAuthenticatedAt: Date) {
         self.rawData = rawData
         self.kind = kind
         self.lastAuthenticatedAt = lastAuthenticatedAt
@@ -37,7 +37,8 @@ extension AuthenticationFactor: Codable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         lastAuthenticatedAt = try container.decode(key: .lastAuthenticatedAt)
-        kind = try container.decode(key: .kind)
+        let rawKind: String = try container.decode(key: .kind)
+        kind = AuthenticationFactorType(rawValue: rawKind)
         rawData = try .init(from: decoder)
     }
 
