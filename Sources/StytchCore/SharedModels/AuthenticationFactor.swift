@@ -61,4 +61,10 @@ public extension AuthenticationFactor {
     var deliveryMethod: String? {
         rawData["delivery_method"].stringValue
     }
+
+    /// Whether this factor was last authenticated more than one hour ago.
+    var isStale: Bool {
+        let oneHour: TimeInterval = 60 * 60
+        return Date().timeIntervalSince(lastAuthenticatedAt) > oneHour
+    }
 }
