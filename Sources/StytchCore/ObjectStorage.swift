@@ -1,5 +1,8 @@
 import Combine
 import Foundation
+#if os(iOS)
+import UIKit
+#endif
 
 // swiftlint:disable type_contents_order let_var_whitespace
 
@@ -45,6 +48,12 @@ extension ObjectStorageWrapper {
 class ObjectStorage<WrapperType: ObjectStorageWrapper> {
     private let objectWrapper: WrapperType
     private var cancellable: AnyCancellable?
+    private var protectedDataCancellable: AnyCancellable?
+
+    // How many times publish() will retry when the encryption key is transiently unreadable
+    // (device locked / early launch), with exponential backoff starting at `transientRetryBaseDelay`.
+    private static var maxTransientRetries: Int { 5 }
+    private static var transientRetryBaseDelay: TimeInterval { 0.1 }
 
     private let _onChange = PassthroughSubject<StytchObjectInfo<WrapperType.ObjectType>, Never>()
     var onChange: AnyPublisher<StytchObjectInfo<WrapperType.ObjectType>, Never> {
@@ -58,6 +67,17 @@ class ObjectStorage<WrapperType: ObjectStorageWrapper> {
         cancellable = StartupClient.isInitialized.first().sink { [weak self] _ in
             self?.publish()
         }
+
+        #if os(iOS)
+        // If the encryption key was unreadable during startup (device locked / prewarming), re-publish
+        // once protected data becomes available so consumers can recover the cached object instead of
+        // remaining in an unavailable state.
+        protectedDataCancellable = NotificationCenter.default
+            .publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)
+            .sink { [weak self] _ in
+                self?.publish()
+            }
+        #endif
     }
 
     var object: WrapperType.ObjectType? {
@@ -69,7 +89,7 @@ class ObjectStorage<WrapperType: ObjectStorageWrapper> {
         publish()
     }
 
-    private func publish() {
+    private func publish(retryAttempt: Int = 0) {
         do {
             if let object = try objectWrapper.getObject(), let lastValidatedAtDate = objectWrapper.lastValidatedAtDate {
                 _onChange.send(.available(object, lastValidatedAtDate))
@@ -85,7 +105,24 @@ class ObjectStorage<WrapperType: ObjectStorageWrapper> {
                 }
             }
         } catch let error as EncryptedUserDefaultsError {
-            if error == .noDataFound {
+            if error == .encryptionKeyNotAvailable {
+                // The encryption key could not be read, most likely because the keychain is not accessible
+                // yet (device locked after reboot, app prewarming, or a spurious early-launch failure).
+                // This is transient - the cached object may still be fully intact - so retry with backoff
+                // instead of reporting the object as unavailable, which consumers treat as a logout signal.
+                if retryAttempt < Self.maxTransientRetries {
+                    let delay = Self.transientRetryBaseDelay * pow(2, Double(retryAttempt))
+                    StytchConsoleLogger.error(message: "Encryption key not available while publishing \(objectWrapper.item.name) - retrying in \(delay)s (attempt \(retryAttempt + 1) of \(Self.maxTransientRetries))")
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+                        self?.publish(retryAttempt: retryAttempt + 1)
+                    }
+                } else {
+                    // Retries exhausted - report the error, but keep listening for protected data to become
+                    // available so we can still recover by re-publishing later.
+                    _onChange.send(.unavailable(error))
+                    logExceptionalUnavailableCase(error: error)
+                }
+            } else if error == .noDataFound {
                 // if the underlying error was that no data could be found, check if we were _expecting_ there to be data
                 if objectWrapper.dataWasExpected {
                     // if it was expected to exist, send the error that was encountered. This is an exceptional .unavailable case

@@ -55,6 +55,7 @@ struct BiometricPrivateKeyRegistration: Codable {
 }
 
 public enum KeychainError: Swift.Error, Equatable {
+    case encryptionKeyUnavailable
     case resultMissingAccount
     case resultMissingDates
     case resultNotArray

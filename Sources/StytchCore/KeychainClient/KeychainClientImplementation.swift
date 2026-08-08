@@ -21,21 +21,23 @@ final class KeychainClientImplementation: KeychainClient {
             if let cachedEncryptionKey {
                 return cachedEncryptionKey
             }
-            #if os(iOS)
-            if UIApplication.shared.isProtectedDataAvailable {
-                try? getEncryptionKey()
-                didInitializeKeychainData = true
-            } else {
-                // For some reason, we are trying to read the encryption key before protected data became available
-                // Log that this happened (which it hopefully won't?), but leave the behavior up to the caller (EncryptedUserDefaultsClient) to handle a missing key (throw an error)
-                StytchConsoleLogger.error(message: "Attempted to read encryption key but UIApplication.shared.isProtectedDataAvailable was false")
-            }
-            #else
+            // The keychain read itself is the authoritative availability test: a locked keychain fails the
+            // read with an error, which we treat as transient. We deliberately do not consult
+            // UIApplication.shared.isProtectedDataAvailable here - it is a main-thread-only API and this
+            // getter runs on the keychain queue.
             try? getEncryptionKey()
-            #endif
+            if cachedEncryptionKey != nil {
+                didInitializeKeychainData = true
+            }
             return cachedEncryptionKey
         })
     }
+
+    // Cached, thread-safe view of protected data availability. UIApplication.shared.isProtectedDataAvailable
+    // is a main-thread-only API, so we seed the value from the main thread and keep it current via the
+    // protected data notifications. nil means the value has not been seeded yet.
+    private let protectedDataLock = NSLock()
+    private var protectedDataAvailable: Bool?
 
     private var isOnQueue: Bool {
         DispatchQueue.getSpecific(key: queueKey) != nil
@@ -53,6 +55,15 @@ final class KeychainClientImplementation: KeychainClient {
         #if !os(tvOS) && !os(watchOS)
         contextWithoutUI.interactionNotAllowed = true
         #endif
+        #if os(iOS)
+        NotificationCenter.default.addObserver(forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: nil) { [weak self] _ in
+            self?.setProtectedDataAvailable(true)
+        }
+        NotificationCenter.default.addObserver(forName: UIApplication.protectedDataWillBecomeUnavailableNotification, object: nil, queue: nil) { [weak self] _ in
+            self?.setProtectedDataAvailable(false)
+        }
+        refreshProtectedDataAvailability()
+        #endif
     }
 
     func safelyEnqueue<T>(_ block: () throws -> T) throws -> T {
@@ -67,7 +78,14 @@ final class KeychainClientImplementation: KeychainClient {
         try safelyEnqueue {
             let result = try getFirstQueryResult(KeychainItem.encryptionKey)
             guard let result else {
-                // At this point, we know that protected data IS available, so if the keychain returned nil, then it means the key TRULY doesn't exist, and so we should create a new one
+                // The keychain reported the key as missing. Only trust that verdict and create a new key when
+                // protected data is confirmed available; otherwise treat this as a transient failure so we
+                // never overwrite an existing key that is merely unreadable right now.
+                guard isProtectedDataKnownAvailable else {
+                    refreshProtectedDataAvailability()
+                    StytchConsoleLogger.error(message: "Encryption key not found in keychain, but protected data availability is not confirmed - deferring key creation")
+                    throw KeychainError.encryptionKeyUnavailable
+                }
                 let data = SymmetricKey(size: .bits256).withUnsafeBytes {
                     Data(Array($0))
                 }
@@ -77,6 +95,34 @@ final class KeychainClientImplementation: KeychainClient {
             }
             cachedEncryptionKey = SymmetricKey(data: result.data)
         }
+    }
+
+    private var isProtectedDataKnownAvailable: Bool {
+        #if os(iOS)
+        protectedDataLock.lock()
+        defer { protectedDataLock.unlock() }
+        return protectedDataAvailable == true
+        #else
+        return true
+        #endif
+    }
+
+    private func setProtectedDataAvailable(_ available: Bool) {
+        protectedDataLock.lock()
+        protectedDataAvailable = available
+        protectedDataLock.unlock()
+    }
+
+    private func refreshProtectedDataAvailability() {
+        #if os(iOS)
+        if Thread.isMainThread {
+            setProtectedDataAvailable(UIApplication.shared.isProtectedDataAvailable)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.setProtectedDataAvailable(UIApplication.shared.isProtectedDataAvailable)
+            }
+        }
+        #endif
     }
 
     // swiftlint:disable:next function_body_length
